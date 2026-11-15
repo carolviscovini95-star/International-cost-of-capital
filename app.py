@@ -14,9 +14,10 @@ BETA_HTML = "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/Betas.
 RATINGS = "https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html"
 OECD = (
     "https://sdmx.oecd.org/public/rest/data/"
-    "OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/"
+    "OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0"
 )
 BONDS = "https://tradingeconomics.com/bonds"
+NO_DATE = "Observation date unavailable"
 DEFAULT_INDUSTRY = "Software (System & Application)"
 COUNTRY_NAMES = {
     "BOL": "Bolivia",
@@ -28,7 +29,7 @@ COUNTRY_NAMES = {
     "TWN": "Taiwan",
     "VNM": "Vietnam",
 }
-NO_DATE = "Observation date unavailable"
+EMPTY_QUOTE = (None, None)
 
 
 def fetch(url, **kwargs):
@@ -44,16 +45,16 @@ def metadata(url, date=NO_DATE):
 
 def source_date(text):
     match = re.search(
-        r"(?:as of|updated:?)\s*"
+        r"(?:data as of|as of|updated:?)\s*"
         r"([A-Za-z]+\s+(?:\d{1,2},?\s+)?20\d{2}|\d{1,2}/\d{1,2}/20\d{2})",
         text,
         re.I,
     )
-    return match[1] if match else NO_DATE
+    return match.group(1) if match else NO_DATE
 
 
-def html_rows(soup):
-    for row in soup.find_all("tr"):
+def html_rows(page):
+    for row in page.find_all("tr"):
         yield [
             cell.get_text(" ", strip=True)
             for cell in row.find_all(["td", "th"], recursive=False)
@@ -83,7 +84,6 @@ def parse_betas(rows):
             and pd.notna(beta)
         ):
             betas[name] = float(beta)
-
     if not betas:
         raise ValueError("Industry beta values missing")
     return betas
@@ -92,13 +92,13 @@ def parse_betas(rows):
 @st.cache_data(ttl=3600, show_spinner=False)
 def industry_betas():
     try:
-        workbook = pd.read_excel(
+        sheets = pd.read_excel(
             BytesIO(fetch(BETA_XLS).content),
-            header=None,
             sheet_name=None,
+            header=None,
             engine="xlrd",
         )
-        for sheet in workbook.values():
+        for sheet in sheets.values():
             rows = sheet.values.tolist()
             try:
                 betas = parse_betas(rows)
@@ -109,16 +109,16 @@ def industry_betas():
     except (requests.RequestException, ValueError, ImportError):
         pass
 
-    soup = BeautifulSoup(fetch(BETA_HTML).text, "html.parser")
-    return parse_betas(list(html_rows(soup))), metadata(
-        BETA_HTML, source_date(soup.get_text(" ", strip=True))
+    page = BeautifulSoup(fetch(BETA_HTML).text, "html.parser")
+    return parse_betas(list(html_rows(page))), metadata(
+        BETA_HTML, source_date(page.get_text(" ", strip=True))
     )
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def bbb_spread():
-    soup = BeautifulSoup(fetch(RATINGS).text, "html.parser")
-    for table in soup.find_all("table"):
+    page = BeautifulSoup(fetch(RATINGS).text, "html.parser")
+    for table in page.find_all("table"):
         if not re.search(r"large\s+non.financial", table.get_text(" ", strip=True), re.I):
             continue
         for row in html_rows(table):
@@ -127,18 +127,22 @@ def bbb_spread():
                 if rating.casefold() == "baa2/bbb" and re.fullmatch(
                     r"\d+(?:\.\d+)?%", spread
                 ):
-                    date = source_date(soup.get_text(" ", strip=True))
-                    return float(spread[:-1]), metadata(RATINGS, date)
+                    return float(spread[:-1]), metadata(
+                        RATINGS, source_date(page.get_text(" ", strip=True))
+                    )
     raise ValueError("Large nonfinancial Baa2/BBB row missing")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def corporate_tax(code):
-    url = f"{OECD}{code}.A..ST..S13..."
+def corporate_tax(country_code):
+    url = f"{OECD}/{country_code}.A..ST..S13..."
     response = fetch(
         url,
-        params={"lastNObservations": 1, "format": "csvfile-with-labels"},
-        headers={"Accept": "text/csv"},
+        params={
+            "lastNObservations": 1,
+            "dimensionAtObservation": "AllDimensions",
+            "format": "csvfilewithlabels",
+        },
     )
     data = pd.read_csv(StringIO(response.text))
     data["OBS_VALUE"] = pd.to_numeric(data["OBS_VALUE"], errors="coerce")
@@ -151,25 +155,23 @@ def corporate_tax(code):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def bond_table():
-    soup = BeautifulSoup(fetch(BONDS).text, "html.parser")
+    page = BeautifulSoup(fetch(BONDS).text, "html.parser")
     quotes = {}
-    for row in html_rows(soup):
+    for row in html_rows(page):
         if len(row) < 2:
             continue
         name = re.sub(r"\s+10Y(?:\s+Bond Yield)?$", "", row[0], flags=re.I)
-        value = row[1].rstrip("%").strip()
-        if not re.fullmatch(r"-?\d+(?:\.\d+)?", value):
+        rate = row[1].rstrip("%").strip()
+        if not re.fullmatch(r"-?\d+(?:\.\d+)?", rate):
             continue
         date = next(
             (
                 cell for cell in reversed(row[2:])
-                if re.fullmatch(
-                    r"[A-Za-z]{3}\s*/?\s*\d{1,2}|\d{1,2}/\d{1,2}", cell
-                )
+                if re.fullmatch(r"[A-Za-z]{3}\s*/?\s*\d{1,2}|\d{1,2}/\d{1,2}", cell)
             ),
             NO_DATE,
         )
-        quotes[name.casefold()] = float(value), metadata(BONDS, date)
+        quotes[name.casefold()] = float(rate), metadata(BONDS, date)
     return quotes
 
 
@@ -177,8 +179,8 @@ def bond_table():
 def bond_country_page(country):
     slug = country.lower().replace(" ", "-")
     url = f"https://tradingeconomics.com/{slug}/government-bond-yield"
-    soup = BeautifulSoup(fetch(url).text, "html.parser")
-    text = soup.get_text(" ", strip=True)
+    page = BeautifulSoup(fetch(url).text, "html.parser")
+    text = page.get_text(" ", strip=True)
     if not re.search(r"10.Year Government Bond Yield|10Y Bond Yield", text, re.I):
         raise ValueError("10-year bond series missing")
 
@@ -189,14 +191,12 @@ def bond_country_page(country):
         re.I,
     )
     actual = re.search(
-        r"\bActual\s+(-?\d+(?:\.\d+)?)\s*%?\s+Daily Change",
-        text,
-        re.I,
+        r"\bActual\s+(-?\d+(?:\.\d+)?)\s*%?\s+Daily Change", text, re.I
     )
-    if actual or summary:
-        value = float(actual[1] if actual else summary[1])
-        date = summary[2] if summary else NO_DATE
-        return value, metadata(url, date)
+    if actual:
+        return float(actual[1]), metadata(url, summary[2] if summary else NO_DATE)
+    if summary:
+        return float(summary[1]), metadata(url, summary[2])
     raise ValueError("10-year quote missing")
 
 
@@ -204,8 +204,8 @@ def load(label, loader, fallback):
     try:
         return loader()
     except requests.HTTPError as exc:
-        code = exc.response.status_code if exc.response is not None else "unknown"
-        st.warning(f"{label} unavailable (HTTP {code}).")
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        st.warning(f"{label} unavailable (HTTP {status}).")
     except (requests.RequestException, ValueError, KeyError, ImportError) as exc:
         st.warning(f"{label} unavailable ({type(exc).__name__}: {exc}).")
     return fallback
@@ -218,7 +218,7 @@ def country_yield(country, quotes):
     return load(
         f"{country} 10-year yield",
         lambda: bond_country_page(country),
-        quote or (None, None),
+        quote or EMPTY_QUOTE,
     )
 
 
@@ -234,10 +234,10 @@ def market_input(label, quote, key, minimum=None, maximum=None):
         value = st.number_input(
             label,
             value=value,
-            step=0.01,
-            format="%.4f",
             min_value=minimum,
             max_value=maximum,
+            step=0.01,
+            format="%.4f",
             key=f"input_{key}",
         )
     else:
@@ -246,35 +246,57 @@ def market_input(label, quote, key, minimum=None, maximum=None):
     return value, (label, "Manual" if manual else "Source", source)
 
 
-def calculate(beta, erp, share, tax, usd_yield, local_yield, usd_spread, override):
+def calculate(beta, erp, share, tax, us_yield, local_yield, usd_spread, override):
     equity_share = 1 - share
     levered_beta = beta * (1 + (1 - tax) * share / equity_share)
-    factor = (1 + local_yield) / (1 + usd_yield)
+    factor = (1 + local_yield) / (1 + us_yield)
     local_spread = usd_spread * factor if override is None else override
-    usd_equity = usd_yield + levered_beta * erp
-    local_equity = (1 + usd_equity) * factor - 1
-    usd_debt = usd_yield + usd_spread
+
+    us_equity = us_yield + levered_beta * erp
+    local_equity = (1 + us_equity) * factor - 1
+    us_debt = us_yield + usd_spread
     local_debt = local_yield + local_spread
-    usd_after_tax = usd_debt * (1 - tax)
+    us_after_tax = us_debt * (1 - tax)
     local_after_tax = local_debt * (1 - tax)
 
     results = {
-        "Cost of equity": (usd_equity, local_equity),
-        "Pretax cost of debt": (usd_debt, local_debt),
-        "After-tax cost of debt": (usd_after_tax, local_after_tax),
+        "Cost of equity": (us_equity, local_equity),
+        "Pretax cost of debt": (us_debt, local_debt),
+        "After-tax cost of debt": (us_after_tax, local_after_tax),
         "WACC": (
-            equity_share * usd_equity + share * usd_after_tax,
+            equity_share * us_equity + share * us_after_tax,
             equity_share * local_equity + share * local_after_tax,
         ),
     }
     return results, local_spread, levered_beta
 
 
+def show_sources(entries):
+    with st.expander("Data sources and assumptions"):
+        for label, mode, source in entries:
+            if source:
+                url, date, retrieved = source
+                st.markdown(
+                    f"**{label}** · {mode} · [{date}]({url}) · Retrieved {retrieved}"
+                )
+            else:
+                st.write(f"{label} · {mode} · No source observation loaded")
+        st.write(
+            "The 10-year government yields proxy for risk-free rates. Both currencies "
+            "use the same project tax rate, debt share and equity risk premium. "
+            "USD cost of equity uses CAPM. The local cost of equity and automatic "
+            "local credit spread use the ratio of gross government yields. "
+            "WACC uses the after-tax cost of debt."
+        )
+
+
 def main():
     st.set_page_config(page_title="International Cost of Capital", layout="wide")
     st.title("International Cost of Capital")
     if st.button("Refresh source data"):
-        for source in (industry_betas, bbb_spread, corporate_tax, bond_table, bond_country_page):
+        for source in (
+            industry_betas, bbb_spread, corporate_tax, bond_table, bond_country_page
+        ):
             source.clear()
 
     betas, beta_source = load("Damodaran industry betas", industry_betas, ({}, None))
@@ -285,8 +307,8 @@ def main():
         if get_territory_currencies(item.alpha_2)
     }
     names = sorted(countries)
-    project, market = st.columns(2)
 
+    project, market = st.columns(2)
     with project:
         st.subheader("Project assumptions")
         industry = st.selectbox(
@@ -299,6 +321,7 @@ def main():
             st.selectbox("Local currency", currencies)
             if len(currencies) > 1 else currencies[0]
         )
+
         erp = st.number_input("Equity risk premium (%)", value=6.5, step=0.1) / 100
         share = st.number_input(
             "Target debt share (%)", min_value=0.0, max_value=99.99, value=30.0
@@ -306,7 +329,7 @@ def main():
         tax_basis = st.radio("Project tax rate", ["U.S. rate", "Target country rate"])
         tax_code = "USA" if tax_basis == "U.S. rate" else territory.alpha_3
         tax_quote = load(
-            f"OECD tax rate ({tax_code})", lambda: corporate_tax(tax_code), (None, None)
+            f"OECD tax rate ({tax_code})", lambda: corporate_tax(tax_code), EMPTY_QUOTE
         )
         tax, tax_info = market_input(
             "Project corporate tax rate (%)", tax_quote, f"tax_{tax_code}", 0.0, 100.0
@@ -317,28 +340,32 @@ def main():
 
     with market:
         st.subheader("Market inputs")
-        spread_quote = load("Damodaran BBB spread", bbb_spread, (None, None))
+        spread_quote = load("Damodaran BBB spread", bbb_spread, EMPTY_QUOTE)
         quotes = load("Trading Economics bond table", bond_table, {})
         usd_quote = country_yield("United States", quotes)
-        local_quote = usd_quote if country == "United States" else country_yield(country, quotes)
 
         spread, spread_info = market_input("USD BBB spread (%)", spread_quote, "spread")
-        usd, usd_info = market_input("U.S. 10-year yield (%)", usd_quote, "usd", -99.99)
-
+        usd, usd_info = market_input(
+            "U.S. 10-year yield (%)", usd_quote, "usd_yield", -99.99
+        )
         if country == "United States":
-            local, local_info = usd, ("Target country yield", usd_info[1], usd_info[2])
-            st.caption("The target country is the United States, so both columns use the U.S. yield.")
+            local = usd
+            local_info = ("Target country yield", usd_info[1], usd_info[2])
+            st.caption("Both columns use the U.S. yield when the target is the United States.")
         else:
+            local_quote = country_yield(country, quotes)
             local, local_info = market_input(
-                "Target country 10-year yield (%)", local_quote,
-                f"yield_{territory.alpha_3}", -99.99,
+                "Target country 10-year yield (%)",
+                local_quote,
+                f"yield_{territory.alpha_3}",
+                -99.99,
             )
 
         use_override = st.checkbox("Override local BBB spread")
         override = None
         if use_override:
             suggested = None
-            if None not in (spread, local, usd):
+            if None not in (spread, usd, local):
                 suggested = spread * (100 + local) / (100 + usd)
             override = st.number_input(
                 "Manual local BBB spread (%)",
@@ -348,20 +375,7 @@ def main():
                 key=f"local_spread_{territory.alpha_3}",
             )
 
-    with st.expander("Data sources and assumptions"):
-        for label, mode, source in (beta_info, tax_info, spread_info, usd_info, local_info):
-            if source:
-                url, date, retrieved = source
-                st.markdown(f"**{label}** · {mode} · [{date}]({url}) · Retrieved {retrieved}")
-            else:
-                st.write(f"{label} · {mode} · No source observation loaded")
-        st.write(
-            "The 10-year government yields proxy for risk-free rates. Both currencies "
-            "use the same project tax rate, debt share and equity risk premium. "
-            "USD cost of equity uses CAPM. The local cost of equity and automatic local "
-            "credit spread use the ratio of gross government yields. "
-            "WACC uses the after-tax cost of debt."
-        )
+    show_sources((beta_info, tax_info, spread_info, usd_info, local_info))
 
     if None in (beta, tax, spread, usd, local) or (use_override and override is None):
         st.info("Enter the missing inputs to see results.")
@@ -372,6 +386,7 @@ def main():
         None if override is None else override / 100,
     )
     results, active_spread, levered_beta = calculate(beta, *assumptions)
+
     st.subheader("Results")
     st.write(f"Levered beta · **{levered_beta:.4f}**")
     spread_label = "Manual" if use_override else "Calculated"
@@ -380,7 +395,7 @@ def main():
     usd_label = "USD (U.S. basis)"
     local_label = f"{currency} ({country} basis)"
     table = pd.DataFrame(
-        [(metric, f"{a:.4%}", f"{b:.4%}") for metric, (a, b) in results.items()],
+        [(metric, f"{us:.4%}", f"{local:.4%}") for metric, (us, local) in results.items()],
         columns=["Metric", usd_label, local_label],
     )
     st.table(table.set_index("Metric"))
@@ -394,9 +409,9 @@ def main():
     for name, industry_beta in sorted({**betas, industry: beta}.items()):
         metrics, _, _ = calculate(industry_beta, *assumptions)
         row = {"Industry": name, "Unlevered beta": industry_beta}
-        for metric, (a, b) in metrics.items():
-            row[f"{metric} | {usd_label} (%)"] = round(a * 100, 6)
-            row[f"{metric} | {local_label} (%)"] = round(b * 100, 6)
+        for metric, (us_rate, local_rate) in metrics.items():
+            row[f"{metric} | {usd_label} (%)"] = round(us_rate * 100, 6)
+            row[f"{metric} | {local_label} (%)"] = round(local_rate * 100, 6)
         comparison.append(row)
 
     frame = pd.DataFrame(comparison)
